@@ -60,6 +60,7 @@ public class MainActivity extends Activity {
     private static final String KEY_HISTORY = "history";
     private static final String KEY_UA_MODE = "ua_mode";
     private static final String KEY_DIAG = "diag_on";
+    private static final String KEY_PIXEL = "pixel_1to1";
     private static final String DEFAULT_URL = "https://www.baidu.com";
     private static final int HISTORY_LIMIT = 12;
 
@@ -88,7 +89,9 @@ public class MainActivity extends Activity {
                     + "var buf=0;try{if(v.buffered.length)buf=v.buffered.end(v.buffered.length-1)-v.currentTime;}catch(e){}"
                     + "var q=null;try{q=v.getVideoPlaybackQuality?v.getVideoPlaybackQuality():null;}catch(e){}"
                     + "var seg=-1;if(d.segs.length){var s=0;for(var i=0;i<d.segs.length;i++)s+=d.segs[i];seg=Math.round(s/d.segs.length);}"
-                    + "return [v.videoWidth+'x'+v.videoHeight,buf.toFixed(1),"
+                    + "var rw=0,rh=0;try{var r=v.getBoundingClientRect();var dr=window.devicePixelRatio||1;"
+                    + "rw=Math.round(r.width*dr);rh=Math.round(r.height*dr);}catch(e){}"
+                    + "return [v.videoWidth+'x'+v.videoHeight,rw+'x'+rh,buf.toFixed(1),"
                     + "q?(q.droppedVideoFrames+'/'+q.totalVideoFrames):'-',d.stalls,seg,"
                     + "(v.paused?'暂停':'播放')].join('|');"
                     + "}catch(e){return 'ERR:'+e}})()";
@@ -128,6 +131,17 @@ public class MainActivity extends Activity {
         }
     };
 
+    // 悬浮按钮：闲置时隐藏，避免半透明层压在视频上阻止硬件直通
+    private final List<View> toolbarViews = new ArrayList<>();
+    private final Runnable hideToolbar = new Runnable() {
+        @Override
+        public void run() {
+            for (View v : toolbarViews) {
+                v.setVisibility(View.INVISIBLE);
+            }
+        }
+    };
+
     // 更新相关状态
     private final UpdateManager updater = new UpdateManager();
     private UpdateManager.Release foundRelease;
@@ -145,8 +159,19 @@ public class MainActivity extends Activity {
         root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
 
+        // 1:1 像素模式：把 WebView 的密度压到 160dpi，让 CSS 像素等于物理像素。
+        // 系统密度是 2.0 时，1080p 视频会被先缩到 960 再放大回 1920，每帧多两次 GPU 缩放。
+        Context webCtx = this;
+        if (prefs().getBoolean(KEY_PIXEL, false)) {
+            android.content.res.Configuration cfg =
+                    new android.content.res.Configuration(getResources().getConfiguration());
+            cfg.densityDpi = android.util.DisplayMetrics.DENSITY_DEFAULT;
+            cfg.fontScale = 1f;
+            webCtx = createConfigurationContext(cfg);
+        }
+
         try {
-            web = new WebView(this);
+            web = new WebView(webCtx);
         } catch (Throwable t) {
             showFatal("系统缺少 WebView 组件：" + t.getClass().getSimpleName()
                     + "\n请安装 Android System WebView 后重试");
@@ -420,16 +445,35 @@ public class MainActivity extends Activity {
                 return;
             }
             String[] p = raw.split("\\|", -1);
-            if (p.length < 6) {
+            if (p.length < 7) {
                 diagOverlay.setText(raw);
                 return;
             }
-            diagOverlay.setText("画面 " + p[0].replace("x", "×") + "  " + p[5] + "\n"
-                    + "缓冲 +" + p[1] + "s\n"
-                    + "丢帧 " + p[2] + "\n"
-                    + "卡顿 " + p[3] + " 次\n"
-                    + "分片 " + ("-1".equals(p[4]) ? "-" : p[4] + "ms"));
+            diagOverlay.setText("画面 " + p[0].replace("x", "×") + "  " + p[6] + "\n"
+                    + "渲染 " + p[1].replace("x", "×") + "\n"
+                    + "缓冲 +" + p[2] + "s\n"
+                    + "丢帧 " + p[3] + dropRate(p[3]) + "\n"
+                    + "卡顿 " + p[4] + " 次\n"
+                    + "分片 " + ("-1".equals(p[5]) ? "-" : p[5] + "ms"));
         });
+    }
+
+    /** "187/4299" -> " (4.4%)" */
+    private static String dropRate(String pair) {
+        int slash = pair.indexOf('/');
+        if (slash <= 0) {
+            return "";
+        }
+        try {
+            long dropped = Long.parseLong(pair.substring(0, slash));
+            long total = Long.parseLong(pair.substring(slash + 1));
+            if (total <= 0) {
+                return "";
+            }
+            return String.format(java.util.Locale.US, " (%.1f%%)", dropped * 100.0 / total);
+        } catch (NumberFormatException e) {
+            return "";
+        }
     }
 
     /** 读取 WebView 的播放能力与内核版本，结果在「设置」面板里展示。 */
@@ -505,6 +549,9 @@ public class MainActivity extends Activity {
             }
             return super.dispatchKeyEvent(e);
         }
+
+        // 任何按键都先把悬浮按钮亮出来
+        showToolbar();
 
         if (action == KeyEvent.ACTION_DOWN) {
             float base = dp(11);
@@ -644,6 +691,18 @@ public class MainActivity extends Activity {
         lp.topMargin = dp(10);
         lp.rightMargin = dp(10) + index * dp(64);
         root.addView(tv, lp);
+
+        toolbarViews.add(tv);
+        showToolbar();
+    }
+
+    /** 显示悬浮按钮并重新计时，3 秒没有任何按键就自动隐藏。 */
+    private void showToolbar() {
+        for (View v : toolbarViews) {
+            v.setVisibility(View.VISIBLE);
+        }
+        uiHandler.removeCallbacks(hideToolbar);
+        uiHandler.postDelayed(hideToolbar, 3000);
     }
 
     private void showSettings() {
@@ -778,6 +837,17 @@ public class MainActivity extends Activity {
             }
             hideSettings();
             showSettings();
+        }), buttonLp());
+
+        boolean pixel = prefs().getBoolean(KEY_PIXEL, false);
+        toolsRow.addView(button(pixel ? "渲染：1:1" : "渲染：原生", () -> {
+            boolean next = !prefs().getBoolean(KEY_PIXEL, false);
+            prefs().edit().putBoolean(KEY_PIXEL, next).apply();
+            Toast.makeText(this, next
+                            ? "已改为 1:1 像素渲染，界面重启后生效"
+                            : "已恢复原生密度，界面重启后生效",
+                    Toast.LENGTH_SHORT).show();
+            recreate();
         }), buttonLp());
 
         // ---- 检查更新

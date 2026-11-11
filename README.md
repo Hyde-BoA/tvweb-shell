@@ -2,6 +2,11 @@
 
 Android TV / 小米电视上的「网页壳」应用：启动即全屏加载指定网址，用遥控器当鼠标操作，专为网页直播/视频站点适配。
 
+## 下载
+
+已编译好的 APK 在 [Releases](https://github.com/Hyde-BoA/tvweb-shell/releases/latest) 里，`tvweb-shell.apk` 直接用 U 盘拷到电视安装。
+想自己编译就克隆仓库后跑 `bash build.sh`（不依赖 Android Studio）。
+
 - 包名：`com.tvweb.shell`
 - 体积：约 100KB（纯原生，不含 AndroidX）
 - 最低系统：Android 5.0（API 21）

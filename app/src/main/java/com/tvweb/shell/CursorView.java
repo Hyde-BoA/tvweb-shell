@@ -23,6 +23,16 @@ public class CursorView extends View {
     private final float s;
     private long pressAt = 0L;
 
+    /** 闲置多久后隐藏光标（减少一层 overdraw，叠在视频上时对弱芯片更友好） */
+    private static final long IDLE_MS = 3000L;
+
+    private final Runnable hideTask = new Runnable() {
+        @Override
+        public void run() {
+            setVisibility(INVISIBLE);
+        }
+    };
+
     public CursorView(Context context) {
         super(context);
         s = context.getResources().getDisplayMetrics().density * 1.6f;
@@ -57,7 +67,17 @@ public class CursorView extends View {
         int h = getHeight();
         cx = Math.max(4f, Math.min(w - 4f, cx + dx));
         cy = Math.max(4f, Math.min(h - 4f, cy + dy));
+        show();
         invalidate();
+    }
+
+    /** 有按键操作时把光标亮出来，并重新计时隐藏。 */
+    public void show() {
+        if (getVisibility() != VISIBLE) {
+            setVisibility(VISIBLE);
+        }
+        removeCallbacks(hideTask);
+        postDelayed(hideTask, IDLE_MS);
     }
 
     public void placeAt(float x, float y) {
@@ -76,6 +96,7 @@ public class CursorView extends View {
 
     public void pulse() {
         pressAt = System.currentTimeMillis();
+        show();
         invalidate();
         postInvalidateDelayed(120);
         postInvalidateDelayed(240);

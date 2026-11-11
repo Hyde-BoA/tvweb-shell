@@ -110,6 +110,24 @@ adb uninstall com.tvweb.shell
 2. 或 `adb shell am start -n com.tvweb.shell/.MainActivity -e url "..."`
 3. 或改 `MainActivity.DEFAULT_URL` 重新编译
 
+## 播放卡顿排查
+
+同一个网页、同一台电视，Chrome 流畅而本应用卡，通常是这三条：
+
+1. **WebView 内核旧**。电视上单独装的 Chrome 不会自动成为 WebView 内核。
+   设置面板底部会显示 `内核 Chrome/xx`，再对比：
+   ```bash
+   adb shell dumpsys webviewupdate | grep -i "Current WebView package"
+   ```
+2. **UA 被站点嗅探**。v1.2 起已去掉 `wv` 和 `Version/4.0` 标记，让 UA 与普通 Chrome 一致。
+3. **合成路径不同**。Chrome 的视频走 SurfaceView/overlay 直通显示；
+   WebView 把视频画进自己的图层，每帧多一次 GPU 合成，弱芯片上会掉帧。
+   这一条改代码解决不了，只能换成原生播放器。
+
+v1.2 已做的优化：渲染进程优先级提到 IMPORTANT 且不随失焦降级、
+只在整个界面不可见时才暂停 JS 定时器（避免弹音量条就断缓冲）、
+光标闲置 3 秒自动隐藏以减少一层 overdraw。
+
 ## 已知限制
 
 - WebView 不是 Chrome。电视上装了新版 Chrome，不代表 WebView 内核也新。用

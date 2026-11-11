@@ -42,6 +42,8 @@ import android.widget.Toast;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Android TV 网页壳：全屏 WebView + 遥控器虚拟鼠标。
@@ -76,6 +78,7 @@ public class MainActivity extends Activity {
     private WebChromeClient.CustomViewCallback customCallback;
 
     private String diag = "尚未检测";
+    private String kernel = "检测中";
     private long lastBackAt = 0L;
 
     // 更新相关状态
@@ -133,11 +136,28 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        // 只在这里恢复定时器：onPause 在弹音量条、系统面板时会触发，
+        // 那时冻结 JS 会让播放器停止续填 buffer，回来就卡一下。
+        if (web != null) {
+            web.resumeTimers();
+        }
+    }
+
+    @Override
+    protected void onStop() {
+        if (web != null) {
+            web.pauseTimers();
+        }
+        super.onStop();
+    }
+
+    @Override
     protected void onPause() {
         super.onPause();
         if (web != null) {
-            web.onPause();
-            web.pauseTimers();
+            web.onPause(); // 仅暂停动画/定位，不冻结 JS
         }
     }
 
@@ -145,7 +165,6 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         if (web != null) {
-            web.resumeTimers();
             web.onResume();
         }
     }
@@ -178,7 +197,12 @@ public class MainActivity extends Activity {
         s.setCacheMode(WebSettings.LOAD_DEFAULT);
         s.setMediaPlaybackRequiresUserGesture(false); // 直播自动起播
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
-        s.setUserAgentString(s.getUserAgentString() + " TVShell/1.0");
+
+        // UA 伪装成普通 Chrome：去掉 "; wv" 和 "Version/4.0" 标记。
+        // 很多直播站会嗅探 WebView 标记，给一份保守的播放策略（小 buffer / 降级播放器），
+        // 表现就是同样的网络下比 Chrome 更容易缓冲。
+        String ua = s.getUserAgentString();
+        s.setUserAgentString(ua.replace("; wv)", ")").replace("Version/4.0 ", ""));
 
         CookieManager.getInstance().setAcceptCookie(true);
         CookieManager.getInstance().setAcceptThirdPartyCookies(web, true);
@@ -186,6 +210,17 @@ public class MainActivity extends Activity {
         web.setBackgroundColor(Color.BLACK);
         web.setFocusable(true);
         web.setFocusableInTouchMode(true);
+
+        // 提高渲染进程优先级：默认策略在宿主失去焦点时会降级，TV 上很容易触发
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
+        }
+        // 注意：这里刻意不调 setLayerType(LAYER_TYPE_HARDWARE)，那会给 WebView 加一层
+        // 离屏缓冲，视频要多合成一次，弱芯片上反而更卡。硬件加速由 manifest 的
+        // android:hardwareAccelerated="true" 保证。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            s.setOffscreenPreRaster(true);
+        }
 
         web.setWebViewClient(new WebViewClient() {
             @Override
@@ -259,22 +294,54 @@ public class MainActivity extends Activity {
                         | View.SYSTEM_UI_FLAG_FULLSCREEN);
     }
 
-    /** 读取 WebView 的播放能力，结果在「设置」面板里展示。 */
+    /** 读取 WebView 的播放能力与内核版本，结果在「设置」面板里展示。 */
     private void probeCapability() {
         String js = "(function(){try{var v=document.createElement('video');"
-                + "return JSON.stringify({mse:!!window.MediaSource,"
-                + "hls:(v.canPlayType('application/vnd.apple.mpegurl')||'-'),"
-                + "h264:(v.canPlayType('video/mp4; codecs=\"avc1.42E01E\"')||'-'),"
-                + "hevc:(v.canPlayType('video/mp4; codecs=\"hvc1.1.6.L93.B0\"')||'-'),"
-                + "flv:!!window.MediaSource});}catch(e){return '检测失败:'+e}})()";
+                + "function t(x){return v.canPlayType(x)||'-';}"
+                + "return [(!!window.MediaSource)?'Y':'N',t('application/vnd.apple.mpegurl'),"
+                + "t('video/mp4; codecs=\"avc1.42E01E\"'),t('video/mp4; codecs=\"hvc1.1.6.L93.B0\"'),"
+                + "navigator.userAgent].join('|');}catch(e){return 'ERR|'+e}})()";
         web.evaluateJavascript(js, value -> {
-            if (value != null) {
-                diag = value.replace("\"", "").replace("\\", "");
-                if (diagView != null) {
-                    diagView.setText("WebView 能力：" + diag);
-                }
+            if (value == null) {
+                return;
+            }
+            String raw = value.trim();
+            if (raw.length() > 1 && raw.startsWith("\"") && raw.endsWith("\"")) {
+                raw = raw.substring(1, raw.length() - 1);
+            }
+            raw = raw.replace("\\\"", "\"");
+            String[] p = raw.split("\\|", -1);
+            if (p.length < 5) {
+                diag = "检测失败";
+                return;
+            }
+            Matcher m = Pattern.compile("Chrome/([0-9]+)").matcher(p[4]);
+            kernel = m.find() ? "Chrome/" + m.group(1) : "未知";
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("MSE ").append("Y".equals(p[0]) ? "有" : "无");
+            sb.append(" · H264 ").append(shortType(p[2]));
+            sb.append(" · HEVC ").append(shortType(p[3]));
+            sb.append(" · HLS ").append(shortType(p[1]));
+            diag = sb.toString();
+
+            if (diagView != null) {
+                diagView.setText("内核 " + kernel + " · " + diag);
             }
         });
+    }
+
+    private static String shortType(String v) {
+        if (v == null || v.isEmpty() || "-".equals(v)) {
+            return "×";
+        }
+        if (v.startsWith("probably")) {
+            return "✓";
+        }
+        if (v.startsWith("maybe")) {
+            return "~";
+        }
+        return v;
     }
 
     private void showOffline(String reason) {
@@ -567,7 +634,7 @@ public class MainActivity extends Activity {
         updateRow.addView(updateStatus, slp);
 
         diagView = new TextView(this);
-        diagView.setText("WebView 能力：" + diag);
+        diagView.setText("内核 " + kernel + " · " + diag);
         diagView.setTextColor(0xFF6B7280);
         diagView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(

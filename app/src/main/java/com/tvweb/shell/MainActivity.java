@@ -4,12 +4,17 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.StateListDrawable;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
+import android.provider.Settings;
 import android.text.InputType;
+import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.InputDevice;
@@ -30,8 +35,13 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Android TV 网页壳：全屏 WebView + 遥控器虚拟鼠标。
@@ -40,28 +50,40 @@ import android.widget.Toast;
  *   方向键  -> 移动光标（按住加速），光标贴屏幕边缘时页面自动翻页滚动
  *   OK 键   -> 在光标位置模拟一次点击（可点到网页和右上角悬浮按钮）
  *   返回键  -> 网页可后退则后退，否则连按两次退出
- *   音量键  -> 交给系统
  */
 public class MainActivity extends Activity {
 
     private static final String PREFS = "tvweb";
     private static final String KEY_URL = "url";
-    /** 首次运行默认打开的网址，可在应用内「设置」里改，或用 adb 传 url 参数覆盖 */
+    private static final String KEY_HISTORY = "history";
     private static final String DEFAULT_URL = "https://www.baidu.com";
+    private static final int HISTORY_LIMIT = 12;
 
     private FrameLayout root;
     private WebView web;
     private CursorView cursor;
 
-    private LinearLayout panel;
+    private ScrollView panelView;
+    private LinearLayout panelBox;
     private EditText urlEdit;
+    private LinearLayout historyBox;
     private TextView diagView;
+    private TextView updateStatus;
+    private Button updateBtn;
+    private Button clearBtn;
 
     private View customView;
     private WebChromeClient.CustomViewCallback customCallback;
 
     private String diag = "尚未检测";
     private long lastBackAt = 0L;
+
+    // 更新相关状态
+    private final UpdateManager updater = new UpdateManager();
+    private UpdateManager.Release foundRelease;
+    private File pendingApk;
+    private boolean busy;
+    private long clearConfirmAt = 0L;
 
     // ---------------------------------------------------------------- 生命周期
 
@@ -76,7 +98,6 @@ public class MainActivity extends Activity {
         try {
             web = new WebView(this);
         } catch (Throwable t) {
-            // 少数精简 ROM 没有 WebView 组件，这里给出提示而不是直接崩
             showFatal("系统缺少 WebView 组件：" + t.getClass().getSimpleName()
                     + "\n请安装 Android System WebView 后重试");
             return;
@@ -88,7 +109,7 @@ public class MainActivity extends Activity {
         root.addView(cursor, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        addToolbarButton("设置", 0, () -> showSettings());
+        addToolbarButton("设置", 0, this::showSettings);
         addToolbarButton("刷新", 1, () -> web.reload());
 
         setContentView(root);
@@ -105,7 +126,9 @@ public class MainActivity extends Activity {
         setIntent(intent);
         String url = intent.getStringExtra("url");
         if (url != null && url.length() > 0) {
-            load(normalize(url));
+            String u = normalize(url);
+            addHistory(u);
+            load(u);
         }
     }
 
@@ -236,7 +259,7 @@ public class MainActivity extends Activity {
                         | View.SYSTEM_UI_FLAG_FULLSCREEN);
     }
 
-    /** 读取 WebView 的播放能力，结果在「设置」面板里展示，方便判断直播为什么播不出来。 */
+    /** 读取 WebView 的播放能力，结果在「设置」面板里展示。 */
     private void probeCapability() {
         String js = "(function(){try{var v=document.createElement('video');"
                 + "return JSON.stringify({mse:!!window.MediaSource,"
@@ -247,6 +270,9 @@ public class MainActivity extends Activity {
         web.evaluateJavascript(js, value -> {
             if (value != null) {
                 diag = value.replace("\"", "").replace("\\", "");
+                if (diagView != null) {
+                    diagView.setText("WebView 能力：" + diag);
+                }
             }
         });
     }
@@ -267,8 +293,8 @@ public class MainActivity extends Activity {
         int code = e.getKeyCode();
         int action = e.getAction();
 
-        // 设置面板打开时，方向键/OK 交给系统焦点处理（编辑框需要输入法）
-        if (panel != null) {
+        // 设置面板打开时，方向键/OK 交给系统焦点处理（编辑框、历史列表需要常规导航）
+        if (panelView != null) {
             if (code == KeyEvent.KEYCODE_BACK && action == KeyEvent.ACTION_UP) {
                 hideSettings();
                 return true;
@@ -417,7 +443,7 @@ public class MainActivity extends Activity {
     }
 
     private void showSettings() {
-        if (panel != null) {
+        if (panelView != null) {
             return;
         }
 
@@ -426,20 +452,24 @@ public class MainActivity extends Activity {
         box.setPadding(dp(24), dp(20), dp(24), dp(20));
         box.setBackground(rounded(0xF0181A1F, dp(12)));
 
+        // 标题 + 版本
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
         TextView title = new TextView(this);
         title.setText("设置");
         title.setTextColor(0xFFFFFFFF);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
-        box.addView(title);
+        head.addView(title, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        TextView ver = new TextView(this);
+        ver.setText("v" + versionName());
+        ver.setTextColor(0xFF6B7280);
+        ver.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        head.addView(ver);
+        box.addView(head);
 
-        TextView hint = new TextView(this);
-        hint.setText("网址（留空则使用默认地址）。改完点「保存并加载」。");
-        hint.setTextColor(0xFF9AA0A6);
-        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        hlp.topMargin = dp(8);
-        box.addView(hint, hlp);
+        box.addView(label("网址（留空则用默认地址）"));
 
         urlEdit = new EditText(this);
         urlEdit.setSingleLine(true);
@@ -452,69 +482,429 @@ public class MainActivity extends Activity {
         urlEdit.setPadding(dp(12), dp(10), dp(12), dp(10));
         LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        elp.topMargin = dp(10);
+        elp.topMargin = dp(8);
         box.addView(urlEdit, elp);
 
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        rlp.topMargin = dp(14);
+        rlp.topMargin = dp(12);
         box.addView(row, rlp);
 
-        row.addView(button("输入网址", 0, () -> {
+        row.addView(button("输入网址", () -> {
             urlEdit.requestFocus();
             InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
             if (imm != null) {
                 imm.showSoftInput(urlEdit, InputMethodManager.SHOW_FORCED);
             }
-        }), buttonLp(1));
+        }), buttonLp());
 
-        row.addView(button("保存并加载", 1, () -> {
+        row.addView(button("保存并加载", () -> {
             String u = normalize(urlEdit.getText().toString().trim());
             prefs().edit().putString(KEY_URL, u).apply();
+            addHistory(u);
             hideSettings();
             load(u);
-        }), buttonLp(1));
+        }), buttonLp());
 
-        row.addView(button("取消", 2, this::hideSettings), buttonLp(1));
+        row.addView(button("取消", this::hideSettings), buttonLp());
+
+        // ---- 历史记录
+        box.addView(label("历史网址（选中直接打开）"));
+        historyBox = new LinearLayout(this);
+        historyBox.setOrientation(LinearLayout.VERTICAL);
+        box.addView(historyBox);
+        refreshHistory();
+
+        clearBtn = button("清空历史", () -> {
+            long now = SystemClock.uptimeMillis();
+            if (now - clearConfirmAt < 4000) {
+                clearConfirmAt = 0;
+                saveHistory(new ArrayList<>());
+                refreshHistory();
+                clearBtn.setText("清空历史");
+            } else {
+                clearConfirmAt = now;
+                clearBtn.setText("再点一次确认清空");
+                clearBtn.postDelayed(() -> {
+                    if (clearConfirmAt != 0 && SystemClock.uptimeMillis() - clearConfirmAt >= 4000) {
+                        clearConfirmAt = 0;
+                        if (clearBtn != null) {
+                            clearBtn.setText("清空历史");
+                        }
+                    }
+                }, 4100);
+            }
+        });
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        clp.topMargin = dp(8);
+        box.addView(clearBtn, clp);
+
+        box.addView(divider());
+
+        // ---- 检查更新
+        LinearLayout updateRow = new LinearLayout(this);
+        updateRow.setOrientation(LinearLayout.HORIZONTAL);
+        updateRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams ulp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        ulp.topMargin = dp(12);
+        box.addView(updateRow, ulp);
+
+        updateBtn = button("检查更新", this::onUpdateButton);
+        updateRow.addView(updateBtn, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        updateStatus = new TextView(this);
+        updateStatus.setText("当前版本 v" + versionName());
+        updateStatus.setTextColor(0xFF9AA0A6);
+        updateStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        slp.leftMargin = dp(12);
+        updateRow.addView(updateStatus, slp);
 
         diagView = new TextView(this);
-        diagView.setText("WebView 能力检测：" + diag);
-        diagView.setTextColor(0xFF7F8792);
+        diagView.setText("WebView 能力：" + diag);
+        diagView.setTextColor(0xFF6B7280);
         diagView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        dlp.topMargin = dp(14);
+        dlp.topMargin = dp(12);
         box.addView(diagView, dlp);
 
-        FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(
-                dp(680), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
-        root.addView(box, blp);
-        cursor.bringToFront();
-        panel = box;
+        // 包一层 ScrollView，内容多了也不会超出屏幕
+        ScrollView sv = new ScrollView(this);
+        sv.setVerticalScrollBarEnabled(false);
+        sv.addView(box, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        box.post(() -> urlEdit.requestFocus());
+        int panelWidth = dp(720);
+        box.measure(View.MeasureSpec.makeMeasureSpec(panelWidth, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+        int maxHeight = (int) (getResources().getDisplayMetrics().heightPixels * 0.88f);
+        int panelHeight = Math.min(box.getMeasuredHeight(), maxHeight);
+
+        FrameLayout.LayoutParams plp = new FrameLayout.LayoutParams(
+                panelWidth, panelHeight, Gravity.CENTER);
+        root.addView(sv, plp);
+        cursor.bringToFront();
+        panelView = sv;
+        panelBox = box;
+
+        box.post(() -> {
+            if (urlEdit != null) {
+                urlEdit.requestFocus();
+            }
+        });
     }
 
     private void hideSettings() {
-        if (panel != null) {
-            root.removeView(panel);
-            panel = null;
+        if (panelView != null) {
+            root.removeView(panelView);
+            panelView = null;
+            panelBox = null;
             urlEdit = null;
             diagView = null;
+            updateStatus = null;
+            updateBtn = null;
+            clearBtn = null;
+            historyBox = null;
             web.requestFocus();
         }
     }
 
-    private Button button(String label, int index, final Runnable onClick) {
+    // ---------------------------------------------------------------- 历史记录
+
+    private List<String> getHistory() {
+        String raw = prefs().getString(KEY_HISTORY, "");
+        List<String> out = new ArrayList<>();
+        if (raw == null || raw.length() == 0) {
+            return out;
+        }
+        for (String line : raw.split("\n")) {
+            String s = line.trim();
+            if (s.length() > 0) {
+                out.add(s);
+            }
+        }
+        return out;
+    }
+
+    private void saveHistory(List<String> list) {
+        prefs().edit().putString(KEY_HISTORY, TextUtils.join("\n", list)).apply();
+    }
+
+    private void addHistory(String url) {
+        if (url == null || url.length() == 0) {
+            return;
+        }
+        List<String> list = getHistory();
+        list.remove(url);
+        list.add(0, url);
+        while (list.size() > HISTORY_LIMIT) {
+            list.remove(list.size() - 1);
+        }
+        saveHistory(list);
+        if (historyBox != null) {
+            refreshHistory();
+        }
+    }
+
+    private void removeHistory(String url) {
+        List<String> list = getHistory();
+        list.remove(url);
+        saveHistory(list);
+        refreshHistory();
+    }
+
+    private void refreshHistory() {
+        if (historyBox == null) {
+            return;
+        }
+        historyBox.removeAllViews();
+        List<String> list = getHistory();
+        if (list.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("还没有历史记录，保存并加载一个网址后会出现在这里");
+            empty.setTextColor(0xFF6B7280);
+            empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            empty.setPadding(dp(4), dp(10), dp(4), dp(10));
+            historyBox.addView(empty);
+            if (clearBtn != null) {
+                clearBtn.setVisibility(View.GONE);
+            }
+            return;
+        }
+        if (clearBtn != null) {
+            clearBtn.setVisibility(View.VISIBLE);
+        }
+
+        for (String url : list) {
+            LinearLayout item = new LinearLayout(this);
+            item.setOrientation(LinearLayout.HORIZONTAL);
+            item.setGravity(Gravity.CENTER_VERTICAL);
+
+            TextView link = new TextView(this);
+            link.setText(url);
+            link.setSingleLine(true);
+            link.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+            link.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            link.setTextColor(buttonTextColor());
+            link.setBackground(focusableBg());
+            link.setPadding(dp(12), dp(10), dp(12), dp(10));
+            link.setFocusable(true);
+            link.setClickable(true);
+            link.setOnClickListener(v -> {
+                String u = normalize(url);
+                prefs().edit().putString(KEY_URL, u).apply();
+                addHistory(u);
+                hideSettings();
+                load(u);
+            });
+            item.addView(link, new LinearLayout.LayoutParams(0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+            TextView del = new TextView(this);
+            del.setText("×");
+            del.setGravity(Gravity.CENTER);
+            del.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+            del.setTextColor(buttonTextColor());
+            del.setBackground(focusableBg());
+            del.setFocusable(true);
+            del.setClickable(true);
+            del.setOnClickListener(v -> removeHistory(url));
+            LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(40), dp(40));
+            dlp.leftMargin = dp(6);
+            item.addView(del, dlp);
+
+            LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            ilp.topMargin = dp(6);
+            historyBox.addView(item, ilp);
+        }
+    }
+
+    // ---------------------------------------------------------------- 检查更新
+
+    private void onUpdateButton() {
+        if (busy) {
+            return;
+        }
+        if (pendingApk != null) {
+            installApk(pendingApk);
+            return;
+        }
+        if (foundRelease != null) {
+            startDownload();
+            return;
+        }
+        startCheck();
+    }
+
+    private void startCheck() {
+        busy = true;
+        setUpdateButton("检查中…", false);
+        setStatus("正在检查 GitHub 上的最新版本…");
+
+        updater.check(new UpdateManager.Callback() {
+            @Override
+            public void onCheck(UpdateManager.Release release, String error) {
+                busy = false;
+                if (error != null) {
+                    setUpdateButton("重试", true);
+                    setStatus("检查失败：" + error + "（电视可能无法访问 GitHub）");
+                    return;
+                }
+                if (release == null) {
+                    setUpdateButton("检查更新", true);
+                    setStatus("没有找到可用的发布版本");
+                    return;
+                }
+                if (!release.isNewerThan(versionName())) {
+                    setUpdateButton("已是最新", false);
+                    setStatus("当前 v" + versionName() + " 已是最新版本");
+                    return;
+                }
+                foundRelease = release;
+                setUpdateButton("下载并安装", true);
+                setStatus("发现 " + release.tag + "，点「下载并安装」升级");
+            }
+
+            @Override
+            public void onProgress(int percent) {
+                setStatus("正在下载 " + percent + "%");
+            }
+
+            @Override
+            public void onDownload(File apk, String error) {
+                busy = false;
+                if (error != null) {
+                    setUpdateButton("重试下载", true);
+                    setStatus("下载失败：" + error);
+                    return;
+                }
+                pendingApk = apk;
+                setUpdateButton("立即安装", true);
+                setStatus("下载完成，正在调起系统安装程序…");
+                installApk(apk);
+            }
+        });
+    }
+
+    private void startDownload() {
+        busy = true;
+        setUpdateButton("下载中…", false);
+        setStatus("开始下载…");
+        File dest = new File(getCacheDir(), UpdateFileProvider.NAME);
+        updater.download(foundRelease.apkUrl, dest, new UpdateManager.Callback() {
+            @Override
+            public void onCheck(UpdateManager.Release release, String error) {
+                // 不使用
+            }
+
+            @Override
+            public void onProgress(int percent) {
+                setStatus("正在下载 " + percent + "%");
+            }
+
+            @Override
+            public void onDownload(File apk, String error) {
+                busy = false;
+                if (error != null) {
+                    setUpdateButton("重试下载", true);
+                    setStatus("下载失败：" + error);
+                    return;
+                }
+                pendingApk = apk;
+                setUpdateButton("立即安装", true);
+                setStatus("下载完成，正在调起系统安装程序…");
+                installApk(apk);
+            }
+        });
+    }
+
+    private void installApk(File apk) {
+        if (apk == null || !apk.exists()) {
+            setStatus("安装包不存在，请重新下载");
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                && !getPackageManager().canRequestPackageInstalls()) {
+            setStatus("需要先允许「安装未知应用」，已打开设置页");
+            try {
+                startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        Uri.parse("package:" + getPackageName())));
+            } catch (Exception e) {
+                setStatus("请到系统设置里允许本应用安装未知应用");
+            }
+            return;
+        }
+        Uri uri = UpdateFileProvider.uriFor(this);
+        Intent intent = new Intent(Intent.ACTION_VIEW);
+        intent.setDataAndType(uri, "application/vnd.android.package-archive");
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            startActivity(intent);
+        } catch (Exception e) {
+            setStatus("无法启动安装程序：" + e.getClass().getSimpleName());
+        }
+    }
+
+    private void setStatus(String text) {
+        if (updateStatus != null) {
+            updateStatus.setText(text);
+        }
+    }
+
+    private void setUpdateButton(String text, boolean enabled) {
+        if (updateBtn != null) {
+            updateBtn.setText(text);
+            updateBtn.setEnabled(enabled);
+            updateBtn.setAlpha(enabled ? 1f : 0.6f);
+        }
+    }
+
+    private String versionName() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return "?";
+        }
+    }
+
+    // ---------------------------------------------------------------- 控件工厂
+
+    private TextView label(String text) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextColor(0xFF9AA0A6);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        tv.setPadding(0, dp(14), 0, 0);
+        return tv;
+    }
+
+    private View divider() {
+        View v = new View(this);
+        v.setBackgroundColor(0x1AFFFFFF);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(1));
+        lp.topMargin = dp(16);
+        v.setLayoutParams(lp);
+        return v;
+    }
+
+    private Button button(String text, final Runnable onClick) {
         Button b = new Button(this);
-        b.setText(label);
+        b.setText(text);
         b.setAllCaps(false);
         b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         b.setTextColor(buttonTextColor());
         b.setBackground(focusableBg());
-        b.setPadding(dp(8), dp(10), dp(8), dp(10));
+        b.setPadding(dp(14), dp(10), dp(14), dp(10));
         b.setMinHeight(dp(44));
         b.setFocusable(true);
         b.setFocusableInTouchMode(true);
@@ -522,9 +912,9 @@ public class MainActivity extends Activity {
         return b;
     }
 
-    private LinearLayout.LayoutParams buttonLp(int weight) {
+    private LinearLayout.LayoutParams buttonLp() {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
-                ViewGroup.LayoutParams.WRAP_CONTENT, weight);
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         lp.rightMargin = dp(8);
         return lp;
     }
@@ -584,8 +974,8 @@ public class MainActivity extends Activity {
         return s;
     }
 
-    private android.content.res.ColorStateList buttonTextColor() {
-        return new android.content.res.ColorStateList(
+    private ColorStateList buttonTextColor() {
+        return new ColorStateList(
                 new int[][]{
                         new int[]{android.R.attr.state_focused},
                         new int[]{}

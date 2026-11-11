@@ -1,0 +1,10 @@
+tools/jdk-*/
+tools/sdk/
+tools/gh/
+tools/*.zip
+tools/login.log
+build/
+dist/*.idsig
+*.keystore
+.gradle/
+local.properties

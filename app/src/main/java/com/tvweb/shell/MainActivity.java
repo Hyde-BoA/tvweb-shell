@@ -58,8 +58,40 @@ public class MainActivity extends Activity {
     private static final String PREFS = "tvweb";
     private static final String KEY_URL = "url";
     private static final String KEY_HISTORY = "history";
+    private static final String KEY_UA_MODE = "ua_mode";
+    private static final String KEY_DIAG = "diag_on";
     private static final String DEFAULT_URL = "https://www.baidu.com";
     private static final int HISTORY_LIMIT = 12;
+
+    /** UA 策略：0 = 与系统一致但抹掉 WebView 标记，1 = 手机 Chrome，2 = 桌面 Chrome */
+    private static final String[] UA_LABELS = {"UA：标准", "UA：手机", "UA：桌面"};
+    private static final String UA_MOBILE =
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
+                    + "Chrome/116.0.0.0 Mobile Safari/537.36";
+    private static final String UA_DESKTOP =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                    + "Chrome/116.0.0.0 Safari/537.36";
+
+    /** 每秒采样一次播放器状态，用来区分「等分片」和「渲染掉帧」 */
+    private static final String DIAG_JS =
+            "(function(){try{"
+                    + "window.__tvd=window.__tvd||{stalls:0,segs:[],init:false};var d=window.__tvd;"
+                    + "if(!d.init){d.init=true;"
+                    + "document.addEventListener('waiting',function(){d.stalls++},true);"
+                    + "document.addEventListener('stalled',function(){d.stalls++},true);"
+                    + "try{new PerformanceObserver(function(l){var es=l.getEntries();"
+                    + "for(var i=0;i<es.length;i++){var n=es[i].name;"
+                    + "if(/\\.(ts|m4s|mp4|flv|m4v)(\\?|$)/i.test(n)){d.segs.push(Math.round(es[i].duration));"
+                    + "if(d.segs.length>6)d.segs.shift();}}}).observe({entryTypes:['resource']});}catch(e){}"
+                    + "}"
+                    + "var v=document.querySelector('video');if(!v)return 'NOVIDEO';"
+                    + "var buf=0;try{if(v.buffered.length)buf=v.buffered.end(v.buffered.length-1)-v.currentTime;}catch(e){}"
+                    + "var q=null;try{q=v.getVideoPlaybackQuality?v.getVideoPlaybackQuality():null;}catch(e){}"
+                    + "var seg=-1;if(d.segs.length){var s=0;for(var i=0;i<d.segs.length;i++)s+=d.segs[i];seg=Math.round(s/d.segs.length);}"
+                    + "return [v.videoWidth+'x'+v.videoHeight,buf.toFixed(1),"
+                    + "q?(q.droppedVideoFrames+'/'+q.totalVideoFrames):'-',d.stalls,seg,"
+                    + "(v.paused?'暂停':'播放')].join('|');"
+                    + "}catch(e){return 'ERR:'+e}})()";
 
     private FrameLayout root;
     private WebView web;
@@ -80,6 +112,21 @@ public class MainActivity extends Activity {
     private String diag = "尚未检测";
     private String kernel = "检测中";
     private long lastBackAt = 0L;
+
+    // 诊断浮层
+    private TextView diagOverlay;
+    private boolean diagOn;
+    private final android.os.Handler uiHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable diagTick = new Runnable() {
+        @Override
+        public void run() {
+            if (!diagOn) {
+                return;
+            }
+            sampleDiag();
+            uiHandler.postDelayed(this, 1000);
+        }
+    };
 
     // 更新相关状态
     private final UpdateManager updater = new UpdateManager();
@@ -119,6 +166,10 @@ public class MainActivity extends Activity {
 
         configureWebView();
         load(resolveStartUrl(getIntent()));
+
+        if (prefs().getBoolean(KEY_DIAG, false)) {
+            startDiag();
+        }
 
         Toast.makeText(this, "方向键移动光标 · OK 键点击 · 返回键后退", Toast.LENGTH_LONG).show();
     }
@@ -171,6 +222,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        stopDiag();
         if (web != null) {
             web.loadUrl("about:blank");
             web.destroy();
@@ -201,8 +253,7 @@ public class MainActivity extends Activity {
         // UA 伪装成普通 Chrome：去掉 "; wv" 和 "Version/4.0" 标记。
         // 很多直播站会嗅探 WebView 标记，给一份保守的播放策略（小 buffer / 降级播放器），
         // 表现就是同样的网络下比 Chrome 更容易缓冲。
-        String ua = s.getUserAgentString();
-        s.setUserAgentString(ua.replace("; wv)", ")").replace("Version/4.0 ", ""));
+        applyUserAgent(s);
 
         CookieManager.getInstance().setAcceptCookie(true);
         CookieManager.getInstance().setAcceptThirdPartyCookies(web, true);
@@ -273,6 +324,18 @@ public class MainActivity extends Activity {
         });
     }
 
+    private void applyUserAgent(WebSettings s) {
+        int mode = prefs().getInt(KEY_UA_MODE, 0);
+        if (mode == 1) {
+            s.setUserAgentString(UA_MOBILE);
+        } else if (mode == 2) {
+            s.setUserAgentString(UA_DESKTOP);
+        } else {
+            String ua = WebSettings.getDefaultUserAgent(this);
+            s.setUserAgentString(ua.replace("; wv)", ")").replace("Version/4.0 ", ""));
+        }
+    }
+
     private void showFatal(String msg) {
         TextView tv = new TextView(this);
         tv.setText(msg);
@@ -292,6 +355,81 @@ public class MainActivity extends Activity {
                         | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                         | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                         | View.SYSTEM_UI_FLAG_FULLSCREEN);
+    }
+
+    // ---------------------------------------------------------------- 诊断浮层
+
+    private void ensureDiagOverlay() {
+        if (diagOverlay != null) {
+            return;
+        }
+        diagOverlay = new TextView(this);
+        diagOverlay.setTextColor(0xFF8AF0B4);
+        diagOverlay.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        diagOverlay.setTypeface(android.graphics.Typeface.MONOSPACE);
+        diagOverlay.setBackground(rounded(0xB3000000, dp(6)));
+        diagOverlay.setPadding(dp(10), dp(8), dp(10), dp(8));
+        diagOverlay.setClickable(false);
+        diagOverlay.setFocusable(false);
+        diagOverlay.setText("诊断采集中…");
+
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP | Gravity.START);
+        lp.topMargin = dp(10);
+        lp.leftMargin = dp(10);
+        root.addView(diagOverlay, lp);
+        cursor.bringToFront();
+    }
+
+    private void startDiag() {
+        diagOn = true;
+        ensureDiagOverlay();
+        diagOverlay.setVisibility(View.VISIBLE);
+        uiHandler.removeCallbacks(diagTick);
+        uiHandler.post(diagTick);
+    }
+
+    private void stopDiag() {
+        diagOn = false;
+        uiHandler.removeCallbacks(diagTick);
+        if (diagOverlay != null) {
+            diagOverlay.setVisibility(View.GONE);
+        }
+    }
+
+    private void sampleDiag() {
+        if (web == null) {
+            return;
+        }
+        web.evaluateJavascript(DIAG_JS, value -> {
+            if (diagOverlay == null || value == null) {
+                return;
+            }
+            String raw = value.trim();
+            if (raw.length() > 1 && raw.startsWith("\"") && raw.endsWith("\"")) {
+                raw = raw.substring(1, raw.length() - 1);
+            }
+            raw = raw.replace("\\\"", "\"");
+            if ("NOVIDEO".equals(raw)) {
+                diagOverlay.setText("未找到 video 元素");
+                return;
+            }
+            if (raw.startsWith("ERR")) {
+                diagOverlay.setText(raw);
+                return;
+            }
+            String[] p = raw.split("\\|", -1);
+            if (p.length < 6) {
+                diagOverlay.setText(raw);
+                return;
+            }
+            diagOverlay.setText("画面 " + p[0].replace("x", "×") + "  " + p[5] + "\n"
+                    + "缓冲 +" + p[1] + "s\n"
+                    + "丢帧 " + p[2] + "\n"
+                    + "卡顿 " + p[3] + " 次\n"
+                    + "分片 " + ("-1".equals(p[4]) ? "-" : p[4] + "ms"));
+        });
     }
 
     /** 读取 WebView 的播放能力与内核版本，结果在「设置」面板里展示。 */
@@ -331,8 +469,7 @@ public class MainActivity extends Activity {
         });
     }
 
-    private static String shortType(String v) {
-        if (v == null || v.isEmpty() || "-".equals(v)) {
+    private static String shortType(String v) {        if (v == null || v.isEmpty() || "-".equals(v)) {
             return "×";
         }
         if (v.startsWith("probably")) {
@@ -610,6 +747,38 @@ public class MainActivity extends Activity {
         refreshHistory(); // 放在 clearBtn 创建之后，空列表时才能把按钮隐藏掉
 
         box.addView(divider());
+
+        // ---- UA 策略 / 诊断浮层
+        LinearLayout toolsRow = new LinearLayout(this);
+        toolsRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tlp.topMargin = dp(12);
+        box.addView(toolsRow, tlp);
+
+        int uaMode = prefs().getInt(KEY_UA_MODE, 0);
+        toolsRow.addView(button(UA_LABELS[uaMode % UA_LABELS.length], () -> {
+            int next = (prefs().getInt(KEY_UA_MODE, 0) + 1) % UA_LABELS.length;
+            prefs().edit().putInt(KEY_UA_MODE, next).apply();
+            applyUserAgent(web.getSettings());
+            hideSettings();
+            showSettings();
+            web.reload();
+            Toast.makeText(this, "已切换 " + UA_LABELS[next] + "，正在重新加载",
+                    Toast.LENGTH_SHORT).show();
+        }), buttonLp());
+
+        toolsRow.addView(button(diagOn ? "诊断：开" : "诊断：关", () -> {
+            boolean turnOn = !diagOn;
+            prefs().edit().putBoolean(KEY_DIAG, turnOn).apply();
+            if (turnOn) {
+                startDiag();
+            } else {
+                stopDiag();
+            }
+            hideSettings();
+            showSettings();
+        }), buttonLp());
 
         // ---- 检查更新
         LinearLayout updateRow = new LinearLayout(this);

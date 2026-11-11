@@ -831,6 +831,15 @@ public class MainActivity extends Activity {
             setStatus("安装包不存在，请重新下载");
             return;
         }
+        if (!looksLikeZip(apk)) {
+            // 常见情况：下载到的是登录页/错误页而不是 APK
+            setStatus("文件不是有效的安装包，请重试下载");
+            //noinspection ResultOfMethodCallIgnored
+            apk.delete();
+            pendingApk = null;
+            setUpdateButton("重试下载", true);
+            return;
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 && !getPackageManager().canRequestPackageInstalls()) {
             setStatus("需要先允许「安装未知应用」，已打开设置页");
@@ -847,10 +856,33 @@ public class MainActivity extends Activity {
         intent.setDataAndType(uri, "application/vnd.android.package-archive");
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        // 部分国产 ROM 的系统安装器只认 ClipData 里的 URI 授权
+        intent.setClipData(android.content.ClipData.newRawUri("apk", uri));
         try {
             startActivity(intent);
         } catch (Exception e) {
             setStatus("无法启动安装程序：" + e.getClass().getSimpleName());
+        }
+    }
+
+    /** APK 本质是 zip，头两个字节是 PK */
+    private boolean looksLikeZip(File f) {
+        java.io.FileInputStream in = null;
+        try {
+            in = new java.io.FileInputStream(f);
+            int a = in.read();
+            int b = in.read();
+            return a == 'P' && b == 'K';
+        } catch (Exception e) {
+            return false;
+        } finally {
+            if (in != null) {
+                try {
+                    in.close();
+                } catch (Exception ignored) {
+                    // ignore
+                }
+            }
         }
     }
 

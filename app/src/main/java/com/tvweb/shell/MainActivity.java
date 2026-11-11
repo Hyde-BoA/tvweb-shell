@@ -62,6 +62,7 @@ public class MainActivity extends Activity {
     private static final String KEY_DIAG = "diag_on";
     private static final String KEY_PIXEL = "pixel_1to1";
     private static final String KEY_LITE = "lite_mode";
+    private static final String KEY_PURE = "pure_mode";
     private static final String DEFAULT_URL = "https://www.baidu.com";
     private static final int HISTORY_LIMIT = 12;
 
@@ -123,6 +124,31 @@ public class MainActivity extends Activity {
                     + "document.getElementById('fps').textContent=f+' fps';},1000);"
                     + "</script></body></html>";
 
+    /**
+     * 纯净播放：只留 <video>，把播放器界面（渐变背景、模糊层、动画、控制条）全部隐藏，
+     * 视频铺满全屏。注意不能重新加载页面——MSE 的 blob: 地址离开当前文档就失效了。
+     */
+    private static final String PURE_JS =
+            "(function(){try{"
+                    + "var v=document.querySelector('video');"
+                    + "if(!v||!v.videoWidth)return 'WAIT';"
+                    + "var chain=[],n=v;while(n&&n!==document.documentElement){chain.push(n);n=n.parentElement;}"
+                    + "for(var i=0;i<chain.length;i++){var el=chain[i],p=el.parentElement;if(!p)continue;"
+                    + "var kids=p.children;for(var j=0;j<kids.length;j++){"
+                    + "if(kids[j]!==el&&!kids[j].contains(v)){kids[j].style.setProperty('display','none','important');}}}"
+                    + "for(var i=0;i<chain.length;i++){var s=chain[i].style;"
+                    + "s.setProperty('background','#000','important');s.setProperty('opacity','1','important');"
+                    + "s.setProperty('filter','none','important');s.setProperty('transform','none','important');"
+                    + "s.setProperty('visibility','visible','important');s.setProperty('overflow','hidden','important');}"
+                    + "var vs=v.style;vs.setProperty('position','fixed','important');"
+                    + "vs.setProperty('top','0','important');vs.setProperty('left','0','important');"
+                    + "vs.setProperty('width','100vw','important');vs.setProperty('height','100vh','important');"
+                    + "vs.setProperty('z-index','2147483600','important');"
+                    + "vs.setProperty('object-fit','contain','important');"
+                    + "vs.setProperty('transform','none','important');vs.setProperty('filter','none','important');"
+                    + "v.setAttribute('controls','controls');"
+                    + "return 'OK';}catch(e){return 'ERR:'+e}})()";
+
     /** 关掉页面上的动画、滤镜、模糊，减少每帧的全屏合成开销 */
     private static final String LITE_JS =
             "(function(){try{var o=document.getElementById('__tvlite');if(o)return 'on';"
@@ -151,6 +177,38 @@ public class MainActivity extends Activity {
     private String diag = "尚未检测";
     private String kernel = "检测中";
     private long lastBackAt = 0L;
+
+    private int pureTries;
+
+    /** 反复尝试注入纯净模式，直到页面里出现带画面的 video 元素 */
+    private final Runnable pureInject = new Runnable() {
+        @Override
+        public void run() {
+            if (web == null || !prefs().getBoolean(KEY_PURE, false)) {
+                return;
+            }
+            if (pureTries++ >= 20) {
+                return;
+            }
+            web.evaluateJavascript(PURE_JS, value -> {
+                boolean ok = value != null && value.contains("OK");
+                if (!ok) {
+                    uiHandler.postDelayed(pureInject, 1500);
+                }
+            });
+        }
+    };
+
+    private void startPure() {
+        pureTries = 0;
+        uiHandler.removeCallbacks(pureInject);
+        uiHandler.postDelayed(pureInject, 800);
+    }
+
+    private void stopPure() {
+        pureTries = Integer.MAX_VALUE;
+        uiHandler.removeCallbacks(pureInject);
+    }
 
     // 诊断浮层
     private TextView diagOverlay;
@@ -346,6 +404,9 @@ public class MainActivity extends Activity {
                 probeCapability();
                 if (prefs().getBoolean(KEY_LITE, false)) {
                     web.evaluateJavascript(LITE_JS, null);
+                }
+                if (prefs().getBoolean(KEY_PURE, false)) {
+                    startPure();
                 }
             }
 
@@ -916,7 +977,32 @@ public class MainActivity extends Activity {
                     Toast.LENGTH_SHORT).show();
         }), buttonLp());
 
-        toolsRow2.addView(button("渲染自检", () -> {
+        LinearLayout toolsRow3 = new LinearLayout(this);
+        toolsRow3.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams tlp3 = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tlp3.topMargin = dp(8);
+        box.addView(toolsRow3, tlp3);
+
+        boolean pure = prefs().getBoolean(KEY_PURE, false);
+        toolsRow3.addView(button(pure ? "纯净：开" : "纯净：关", () -> {
+            boolean next = !prefs().getBoolean(KEY_PURE, false);
+            prefs().edit().putBoolean(KEY_PURE, next).apply();
+            hideSettings();
+            showSettings();
+            if (next) {
+                startPure();
+                Toast.makeText(this, "正在隐藏播放器界面，只保留视频画面",
+                        Toast.LENGTH_SHORT).show();
+            } else {
+                stopPure();
+                web.reload();
+                Toast.makeText(this, "已恢复播放器界面，正在重新加载",
+                        Toast.LENGTH_SHORT).show();
+            }
+        }), buttonLp());
+
+        toolsRow3.addView(button("渲染自检", () -> {
             hideSettings();
             web.loadDataWithBaseURL(null, SELF_TEST_HTML, "text/html", "utf-8", null);
             Toast.makeText(this, "自检页：只有 CSS 动画，按返回键回原页面", Toast.LENGTH_LONG).show();

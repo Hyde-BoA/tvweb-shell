@@ -61,6 +61,7 @@ public class MainActivity extends Activity {
     private static final String KEY_UA_MODE = "ua_mode";
     private static final String KEY_DIAG = "diag_on";
     private static final String KEY_PIXEL = "pixel_1to1";
+    private static final String KEY_LITE = "lite_mode";
     private static final String DEFAULT_URL = "https://www.baidu.com";
     private static final int HISTORY_LIMIT = 12;
 
@@ -76,7 +77,8 @@ public class MainActivity extends Activity {
     /** 每秒采样一次播放器状态，用来区分「等分片」和「渲染掉帧」 */
     private static final String DIAG_JS =
             "(function(){try{"
-                    + "window.__tvd=window.__tvd||{stalls:0,segs:[],init:false};var d=window.__tvd;"
+                    + "window.__tvd=window.__tvd||{stalls:0,segs:[],init:false,frames:0,lastF:0,fps:0};"
+                    + "var d=window.__tvd;"
                     + "if(!d.init){d.init=true;"
                     + "document.addEventListener('waiting',function(){d.stalls++},true);"
                     + "document.addEventListener('stalled',function(){d.stalls++},true);"
@@ -84,7 +86,9 @@ public class MainActivity extends Activity {
                     + "for(var i=0;i<es.length;i++){var n=es[i].name;"
                     + "if(/\\.(ts|m4s|mp4|flv|m4v)(\\?|$)/i.test(n)){d.segs.push(Math.round(es[i].duration));"
                     + "if(d.segs.length>6)d.segs.shift();}}}).observe({entryTypes:['resource']});}catch(e){}"
+                    + "(function loop(){d.frames++;requestAnimationFrame(loop);})();"
                     + "}"
+                    + "var f=d.frames-d.lastF;d.lastF=d.frames;d.fps=f;"
                     + "var v=document.querySelector('video');if(!v)return 'NOVIDEO';"
                     + "var buf=0;try{if(v.buffered.length)buf=v.buffered.end(v.buffered.length-1)-v.currentTime;}catch(e){}"
                     + "var q=null;try{q=v.getVideoPlaybackQuality?v.getVideoPlaybackQuality():null;}catch(e){}"
@@ -93,8 +97,17 @@ public class MainActivity extends Activity {
                     + "rw=Math.round(r.width*dr);rh=Math.round(r.height*dr);}catch(e){}"
                     + "return [v.videoWidth+'x'+v.videoHeight,rw+'x'+rh,buf.toFixed(1),"
                     + "q?(q.droppedVideoFrames+'/'+q.totalVideoFrames):'-',d.stalls,seg,"
-                    + "(v.paused?'暂停':'播放')].join('|');"
+                    + "(v.paused?'暂停':'播放'),d.fps].join('|');"
                     + "}catch(e){return 'ERR:'+e}})()";
+
+    /** 关掉页面上的动画、滤镜、模糊，减少每帧的全屏合成开销 */
+    private static final String LITE_JS =
+            "(function(){try{var o=document.getElementById('__tvlite');if(o)return 'on';"
+                    + "var e=document.createElement('style');e.id='__tvlite';"
+                    + "e.textContent='*,*::before,*::after{animation:none!important;"
+                    + "transition:none!important;backdrop-filter:none!important;"
+                    + "-webkit-backdrop-filter:none!important;filter:none!important}';"
+                    + "document.documentElement.appendChild(e);return 'on';}catch(e){return 'ERR'}})()";
 
     private FrameLayout root;
     private WebView web;
@@ -307,6 +320,9 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 probeCapability();
+                if (prefs().getBoolean(KEY_LITE, false)) {
+                    web.evaluateJavascript(LITE_JS, null);
+                }
             }
 
             @Override
@@ -445,7 +461,7 @@ public class MainActivity extends Activity {
                 return;
             }
             String[] p = raw.split("\\|", -1);
-            if (p.length < 7) {
+            if (p.length < 8) {
                 diagOverlay.setText(raw);
                 return;
             }
@@ -453,6 +469,7 @@ public class MainActivity extends Activity {
                     + "渲染 " + p[1].replace("x", "×") + "\n"
                     + "缓冲 +" + p[2] + "s\n"
                     + "丢帧 " + p[3] + dropRate(p[3]) + "\n"
+                    + "页面 " + p[7] + " fps\n"
                     + "卡顿 " + p[4] + " 次\n"
                     + "分片 " + ("-1".equals(p[5]) ? "-" : p[5] + "ms"));
         });
@@ -839,8 +856,15 @@ public class MainActivity extends Activity {
             showSettings();
         }), buttonLp());
 
+        LinearLayout toolsRow2 = new LinearLayout(this);
+        toolsRow2.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams tlp2 = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tlp2.topMargin = dp(8);
+        box.addView(toolsRow2, tlp2);
+
         boolean pixel = prefs().getBoolean(KEY_PIXEL, false);
-        toolsRow.addView(button(pixel ? "渲染：1:1" : "渲染：原生", () -> {
+        toolsRow2.addView(button(pixel ? "渲染：1:1" : "渲染：原生", () -> {
             boolean next = !prefs().getBoolean(KEY_PIXEL, false);
             prefs().edit().putBoolean(KEY_PIXEL, next).apply();
             Toast.makeText(this, next
@@ -848,6 +872,19 @@ public class MainActivity extends Activity {
                             : "已恢复原生密度，界面重启后生效",
                     Toast.LENGTH_SHORT).show();
             recreate();
+        }), buttonLp());
+
+        boolean lite = prefs().getBoolean(KEY_LITE, false);
+        toolsRow2.addView(button(lite ? "特效：已关" : "特效：正常", () -> {
+            boolean next = !prefs().getBoolean(KEY_LITE, false);
+            prefs().edit().putBoolean(KEY_LITE, next).apply();
+            hideSettings();
+            showSettings();
+            web.reload();
+            Toast.makeText(this, next
+                            ? "已关闭页面动画/滤镜，正在重新加载"
+                            : "已恢复页面特效，正在重新加载",
+                    Toast.LENGTH_SHORT).show();
         }), buttonLp());
 
         // ---- 检查更新

@@ -515,7 +515,6 @@ public class MainActivity extends Activity {
         historyBox = new LinearLayout(this);
         historyBox.setOrientation(LinearLayout.VERTICAL);
         box.addView(historyBox);
-        refreshHistory();
 
         clearBtn = button("清空历史", () -> {
             long now = SystemClock.uptimeMillis();
@@ -541,6 +540,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         clp.topMargin = dp(8);
         box.addView(clearBtn, clp);
+        refreshHistory(); // 放在 clearBtn 创建之后，空列表时才能把按钮隐藏掉
 
         box.addView(divider());
 

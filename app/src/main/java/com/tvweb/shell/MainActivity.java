@@ -100,6 +100,29 @@ public class MainActivity extends Activity {
                     + "(v.paused?'暂停':'播放'),d.fps].join('|');"
                     + "}catch(e){return 'ERR:'+e}})()";
 
+    /** 内置自检页：只有一个移动的渐变方块，用来判断 WebView 自身能跑多少帧 */
+    private static final String SELF_TEST_HTML =
+            "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                    + "<style>html,body{margin:0;height:100%;background:#101014;overflow:hidden;"
+                    + "font-family:monospace;color:#7cffb2}"
+                    + "#fps{font-size:64px;padding:20px}"
+                    + "#hint{font-size:16px;color:#666;padding:0 20px}"
+                    + "#box{position:absolute;top:170px;left:0;width:160px;height:160px;"
+                    + "background:linear-gradient(90deg,#ff00cc,#00ccff);"
+                    + "animation:mv 2.4s linear infinite}"
+                    + "@keyframes mv{from{left:0}to{left:calc(100% - 160px)}}"
+                    + "</style></head><body>"
+                    + "<div id='fps'>--</div>"
+                    + "<div id='hint'>内置自检页：只有一个 CSS 动画方块，无网络请求。"
+                    + "正常应接近 60</div>"
+                    + "<div id='box'></div>"
+                    + "<script>var n=0,t=performance.now();"
+                    + "(function loop(){n++;requestAnimationFrame(loop);})();"
+                    + "setInterval(function(){var now=performance.now();"
+                    + "var f=Math.round(n*1000/(now-t));n=0;t=now;"
+                    + "document.getElementById('fps').textContent=f+' fps';},1000);"
+                    + "</script></body></html>";
+
     /** 关掉页面上的动画、滤镜、模糊，减少每帧的全屏合成开销 */
     private static final String LITE_JS =
             "(function(){try{var o=document.getElementById('__tvlite');if(o)return 'on';"
@@ -132,6 +155,7 @@ public class MainActivity extends Activity {
     // 诊断浮层
     private TextView diagOverlay;
     private boolean diagOn;
+    private String hwInfo = "";
     private final android.os.Handler uiHandler = new android.os.Handler(android.os.Looper.getMainLooper());
     private final Runnable diagTick = new Runnable() {
         @Override
@@ -414,6 +438,10 @@ public class MainActivity extends Activity {
         diagOverlay.setFocusable(false);
         diagOverlay.setText("诊断采集中…");
 
+        hwInfo = "硬件加速 " + ((web != null && web.isHardwareAccelerated()) ? "开" : "关")
+                + " · 图层 " + (web != null && web.getLayerType() == View.LAYER_TYPE_HARDWARE
+                ? "硬件" : web != null && web.getLayerType() == View.LAYER_TYPE_SOFTWARE ? "软件" : "无");
+
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP | Gravity.START);
@@ -471,7 +499,8 @@ public class MainActivity extends Activity {
                     + "丢帧 " + p[3] + dropRate(p[3]) + "\n"
                     + "页面 " + p[7] + " fps\n"
                     + "卡顿 " + p[4] + " 次\n"
-                    + "分片 " + ("-1".equals(p[5]) ? "-" : p[5] + "ms"));
+                    + "分片 " + ("-1".equals(p[5]) ? "-" : p[5] + "ms")
+                    + (hwInfo.length() > 0 ? "\n" + hwInfo : ""));
         });
     }
 
@@ -885,6 +914,12 @@ public class MainActivity extends Activity {
                             ? "已关闭页面动画/滤镜，正在重新加载"
                             : "已恢复页面特效，正在重新加载",
                     Toast.LENGTH_SHORT).show();
+        }), buttonLp());
+
+        toolsRow2.addView(button("渲染自检", () -> {
+            hideSettings();
+            web.loadDataWithBaseURL(null, SELF_TEST_HTML, "text/html", "utf-8", null);
+            Toast.makeText(this, "自检页：只有 CSS 动画，按返回键回原页面", Toast.LENGTH_LONG).show();
         }), buttonLp());
 
         // ---- 检查更新
